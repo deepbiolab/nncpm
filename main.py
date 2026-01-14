@@ -315,22 +315,26 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = float("inf")
 
-    def __call__(self, val_loss, model):
+    def __call__(self, val_loss, model, stats):
         score = -val_loss
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(val_loss, model, stats)
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(val_loss, model, stats)
             self.counter = 0
 
-    def save_checkpoint(self, val_loss, model):
-        torch.save(model.state_dict(), self.save_path)
+    def save_checkpoint(self, val_loss, model, stats):
+        checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'stats': stats
+                }
+        torch.save(checkpoint, self.save_path)
         self.val_loss_min = val_loss
 
 
@@ -474,13 +478,14 @@ def train_pipeline(file_path="data/test.csv"):
             )
 
             scheduler.step(val_avg)
-            early_stopping(val_avg, net)
+            early_stopping(val_avg, net, stats=stats)
             if early_stopping.early_stop:
                 print("--- Early stopping triggered ---")
                 break
 
     print(f"\nLoading best model from {early_stopping.save_path}...")
-    net.load_state_dict(torch.load(early_stopping.save_path))
+    checkpoint = torch.load(early_stopping.save_path, map_location=CONFIG["device"])
+    net.load_state_dict(checkpoint['model_state_dict'])
     return net, dataset, stats, history
 
 
@@ -527,68 +532,124 @@ def plot_training_metrics(history, state_cols):
     plt.savefig("training_metrics_detailed.png", dpi=150)
 
 
-def visualize_prediction(net, dataset, stats, exp_id, save_path=None):
+def visualize_prediction(net, dataset, stats, exp_id, save_path=None, interval=15):
     net.eval()
     exp_data = dataset.get_exp_events(exp_id)
-    t_start, t_end = exp_data["times"][0].item(), exp_data["times"][-1].item()
-    t_dense = torch.linspace(t_start, t_end, 200).to(CONFIG["device"])
-
+    t_start, t_end = exp_data['times'][0].item(), exp_data['times'][-1].item()
+    t_dense = torch.linspace(t_start, t_end, interval).to(CONFIG['device'])
+    
     with torch.no_grad():
         pred_y = solve_with_events(net, exp_data, stats, t_eval_points=t_dense)
     t_pred, y_pred = t_dense.cpu().numpy(), pred_y.cpu().numpy()
-
+    
     # Ground truth (handle NaNs for plotting)
-    t_true = exp_data["times"].cpu().numpy()
-    y_true = exp_data["targets"].cpu().numpy()
-
+    t_true = exp_data['times'].cpu().numpy()
+    y_true = exp_data['targets'].cpu().numpy()
+    mask_up = exp_data['mask'].cpu().numpy()
+    
     cols = dataset.state_cols
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     axes = axes.flatten()
     for i, col in enumerate(cols):
         ax = axes[i]
-        ax.plot(t_pred, y_pred[:, i], label="HR Model", color="tab:blue")
-
-        # Only plot valid points (not NaN)
-        valid_mask = ~np.isnan(y_true[:, i])
-        if np.any(valid_mask):
-            ax.scatter(
-                t_true[valid_mask],
-                y_true[valid_mask, i],
-                label="Exp Data",
-                color="tab:red",
-                zorder=5,
-            )
-
+        ax.plot(t_pred, y_pred[:, i], label='HR Model', color='tab:blue')
+        mi = mask_up[:, i].astype(bool)
+        ax.scatter(t_true[mi], y_true[mi, i], label='Exp Data', color='tab:red', zorder=5)
         ax.set_title(col)
-        ax.grid(True, linestyle="--", alpha=0.5)
-        if i == 0:
-            ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.5)
+        if i==0: ax.legend()
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
+    if save_path: plt.savefig(save_path)
     plt.close()
 
+# ==========================================
+# 9. Simulation / Inference Module [New]
+# ==========================================
+def run_simulation(csv_path, model_path='best_hr_model.pth', interval=200):
+    """
+    纯模拟模式：不要求输入数据有真实值，仅根据控制指令外推
+    """
+    if not os.path.exists(model_path):
+        print(f"Error: Model {model_path} not found."); return
 
-if __name__ == "__main__":
-    if os.path.exists("data/real_world_data.csv"):
-        # Train
-        model, ds, stats, history = train_pipeline(file_path="data/real_world_data.csv")
+    # 1. 加载 Checkpoint
+    checkpoint = torch.load(model_path, map_location=CONFIG["device"])
+    train_stats = checkpoint['stats']
+    
+    # 2. 实例化数据集 (加载全部数据作为待模拟对象)
+    sim_ds = BioreactorDataset(csv_path, split_ratio=[1.0, 0.0, 0.0])
+    
+    # 3. 初始化网络
+    net = KineticsNet(input_dim=9, output_dim=6).to(CONFIG["device"])
+    net.load_state_dict(checkpoint['model_state_dict'])
+    net.eval()
 
-        # Plot Metrics
+    # 4. 执行模拟并绘图
+    for exp_id in sim_ds.all_exp_ids:
+        print(f"Simulating: {exp_id}...")
+        # 内部 visualize_prediction 已支持 Mask，无真实点时自动只画线
+        visualize_prediction(net, sim_ds, train_stats, exp_id, 
+                             save_path=f"simulation_{exp_id}.png", interval=interval)
+
+
+def main(task_type="train", data_path="data/real_world_data.csv", model_path="best_hr_model.pth"):
+    """
+    任务管理器
+    task_type: "train" (训练+评估), "evaluate" (仅加载权重评估), "simulation" (纯模拟预测)
+    """
+    device = CONFIG["device"]
+
+    if task_type == "train":
+        print(f"\n>>> Starting Task: TRAINING using {data_path}")
+        model, ds, stats, history = train_pipeline(file_path=data_path)
         plot_training_metrics(history, ds.state_cols)
-
-        # Eval
+        
         print("\n--- Final Evaluation on Test Set ---")
         test_avg, test_vec = run_evaluation(model, ds, stats, ds.test_ids)
         print(f"Final Test NRMSE (Avg): {test_avg:.2f}")
         for i, c in enumerate(ds.state_cols):
             print(f"  {c}: {test_vec[i]:.2f}")
+        
+        # 可视化前5个测试案例
+        for sid in ds.test_ids[:5]:
+            visualize_prediction(model, ds, stats, sid, save_path=f"test_pred_{sid}.png")
 
-        # Visualize
-        if len(ds.test_ids) > 0:
-            for i in range(min(10, len(ds.test_ids))):
-                sid = ds.test_ids[i]
-                print(f"Visualizing {sid}...")
-                visualize_prediction(model, ds, stats, sid, save_path=f"pred_{sid}.png")
+    elif task_type == "evaluate":
+        print(f"\n>>> Starting Task: EVALUATION using {model_path}")
+        if not os.path.exists(model_path):
+            print(f"Error: Model {model_path} not found!"); return
+        
+        checkpoint = torch.load(model_path, map_location=device)
+        stats = checkpoint['stats']
+        
+        # 加载数据集（评估模式）
+        ds = BioreactorDataset(data_path, split_ratio=[0.0, 0.0, 1.0]) 
+        net = KineticsNet(input_dim=9, output_dim=6).to(device)
+        net.load_state_dict(checkpoint['model_state_dict'])
+        
+        test_avg, test_vec = run_evaluation(net, ds, stats, ds.test_ids)
+        print(f"NRMSE on {data_path}: {test_avg:.2f}")
+        for i, c in enumerate(ds.state_cols):
+            print(f"  {c}: {test_vec[i]:.2f}")
+
+        for sid in ds.test_ids[:5]:
+            visualize_prediction(net, ds, stats, sid, save_path=f"test_pred_{sid}.png", interval=30)
+
+    elif task_type == "simulation":
+        print(f"\n>>> Starting Task: SIMULATION using {data_path}")
+        run_simulation(data_path, model_path=model_path)
+
     else:
-        print("Error: 'novel.csv' not found.")
+        print("Invalid task_type. Choose from ['train', 'evaluate', 'simulation']")
+
+if __name__ == "__main__":
+    # 配置文件路径
+    TRAIN_DATA = "data/real_world_data.csv"
+    NEW_DATA = "data/novel.csv"
+    MODEL_FILE = "best_hr_model.pth"
+
+    # if os.path.exists(TRAIN_DATA):
+    #     main(task_type="train", data_path=TRAIN_DATA)
+    
+    if os.path.exists(MODEL_FILE) and os.path.exists(NEW_DATA):
+        main(task_type="evaluate", data_path=NEW_DATA, model_path=MODEL_FILE)
