@@ -43,6 +43,10 @@ class Config:
     # Multi-task settings
     target_product: str = "HP5"
     n_target_shots: int = 2  # Few-shot learning samples
+
+    # Single-task settings
+    single_prod_train_ratio: float = 0.1
+    single_prod_val_ratio: float = 0.1
     
     # Training hyperparameters
     learning_rate: float = 0.002
@@ -53,7 +57,7 @@ class Config:
     grad_clip_norm: float = 0.5
     
     # ODE solver settings
-    ode_method: str = "euler"
+    ode_method: str = "rk4"
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-7
     
@@ -160,6 +164,10 @@ class BioreactorDataset:
         """
         self.config = config
         self.df = pd.read_csv(csv_path)
+
+        if self.PROD_ID_COL not in self.df.columns:
+            print("Info: No Product_ID found. Auto-filling as 'Default_Product'.")
+            self.df[self.PROD_ID_COL] = "Default_Product"
         
         # Create unique experiment identifiers: "Product_ExpID"
         self._create_unique_ids()
@@ -195,17 +203,28 @@ class BioreactorDataset:
         only n_target_shots samples used for training.
         """
         all_exp_ids = self.df["Unique_ID"].unique()
+
+        if self.num_products > 1:
+            self._split_multi_product_few_shot(all_exp_ids)
+        else:
+            self._split_single_product_random(all_exp_ids)
         
+        print(f"Dataset Split Summary (Products: {self.num_products}):")
+        print(f"  Train: {len(self.train_ids)} runs")
+        print(f"  Val  : {len(self.val_ids)} runs")
+        print(f"  Test : {len(self.test_ids)} runs")
+
+    def _split_multi_product_few_shot(self, all_exp_ids):
+        """Original logic for multi-task few-shot learning."""
         # Map unique_id -> product_name
         exp_to_product = self.df.groupby("Unique_ID")[self.PROD_ID_COL].first().to_dict()
         
-        # Separate historical products from target product
         historical_exps = []
         target_exps = []
         target_name = self.config.target_product
         
         for uid in all_exp_ids:
-            if exp_to_product[uid] == target_name:
+            if exp_to_product.get(uid) == target_name:
                 target_exps.append(uid)
             else:
                 historical_exps.append(uid)
@@ -225,11 +244,20 @@ class BioreactorDataset:
         self.train_ids = train_pool[n_val:]
         self.test_ids = np.array(test_target)
         self.all_exp_ids = all_exp_ids
+
+    def _split_single_product_random(self, all_exp_ids):
+        """New logic for standard single-product training."""
+        # Just shuffle and split by ratio
+        np.random.shuffle(all_exp_ids)
+        n_total = len(all_exp_ids)
         
-        print(f"Split Strategy for Target '{target_name}':")
-        print(f"  Train: {len(self.train_ids)} runs")
-        print(f"  Val  : {len(self.val_ids)} runs")
-        print(f"  Test : {len(self.test_ids)} runs")
+        n_train = int(n_total * self.config.single_prod_train_ratio)
+        n_val = int(n_total * self.config.single_prod_val_ratio)
+        
+        self.train_ids = all_exp_ids[:n_train]
+        self.val_ids = all_exp_ids[n_train : n_train + n_val]
+        self.test_ids = all_exp_ids[n_train + n_val :]
+        self.all_exp_ids = all_exp_ids
     
     def _compute_statistics(self) -> None:
         """Compute normalization statistics from training data only."""
@@ -455,9 +483,6 @@ class ReactionODEFunc(nn.Module):
     with neural network corrections for unknown kinetics.
     """
     
-    RATE_CLAMP_MIN = -20.0
-    RATE_CLAMP_MAX = 20.0
-    
     def __init__(
         self,
         kinetics_net: KineticsNet,
@@ -502,20 +527,19 @@ class ReactionODEFunc(nn.Module):
         # Normalize inputs
         norm_y = (y - self.state_mean) / self.state_std
         norm_controls = (controls - self.input_mean) / self.input_std
-        nn_input = torch.cat([norm_y, norm_controls], dim=-1)
+        
+        metabolites_indices = [0, 1, 2, 3, 4] # exclude titer
+        norm_y_features = norm_y[metabolites_indices]
+        nn_input = torch.cat([norm_y_features, norm_controls], dim=-1)
         
         # Predict kinetic rates
         rates = self.net(nn_input.unsqueeze(0), self.product_idx).squeeze(0)
-        rates = torch.clamp(rates, min=self.RATE_CLAMP_MIN, max=self.RATE_CLAMP_MAX)
         
-        # Unpack rates
+        # # Unpack rates
         mu, q_glc, q_gln, q_amm, q_lac, q_prod = (
             rates[0], rates[1], rates[2], rates[3], rates[4], rates[5]
         )
-        
-        # Ensure positive cell concentration
-        x_v = torch.nn.functional.softplus(y[0])
-        q_prod = torch.relu(q_prod)
+        x_v = torch.nn.functional.softplus(y[0]) 
         
         # Compute derivatives
         d_vcd = mu * x_v
@@ -841,6 +865,10 @@ def plot_product_embeddings(
         save_path: Path to save the plot.
         config: Configuration object.
     """
+    if dataset.num_products < 2:
+        print("Single product detected. Skipping embedding plot.")
+        return
+
     net.eval()
     
     if config.embedding_dim != 2:
@@ -962,6 +990,44 @@ def visualize_prediction(
         plt.savefig(save_path, dpi=150)
     plt.close()
 
+def plot_training_metrics(history, state_cols):
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+    val_epochs = np.arange(1, len(history["val_nrmse_avg"]) + 1)
+    if len(val_epochs) != len(epochs):
+        val_epochs = np.linspace(1, len(epochs), len(history["val_nrmse_avg"]))
+
+    val_vars_np = np.array(history["val_nrmse_vars"])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    ax1.plot(
+        epochs, history["train_loss"], label="Train Loss", color="black", alpha=0.6
+    )
+    ax1_r = ax1.twinx()
+    ax1_r.plot(
+        val_epochs,
+        history["val_nrmse_avg"],
+        label="Val Avg NRMSE",
+        color="red",
+        linewidth=2,
+    )
+    ax1.set_title("Training Loss & Avg NRMSE")
+    ax1.legend(loc="upper left")
+    ax1_r.legend(loc="upper right")
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(state_cols)))
+    if len(val_epochs) > 0:
+        for i, col_name in enumerate(state_cols):
+            ax2.plot(
+                val_epochs,
+                val_vars_np[:, i],
+                label=col_name,
+                color=colors[i],
+                linewidth=2,
+            )
+    ax2.set_title("NRMSE per Variable")
+    ax2.legend()
+    plt.tight_layout()
+    plt.savefig("training_metrics_detailed.png", dpi=150)
 
 # ==============================================================================
 # Training Pipeline
@@ -987,7 +1053,7 @@ def train_model(
     
     # Initialize model
     net = KineticsNet(
-        input_dim=9,
+        input_dim=8,
         output_dim=6,
         num_products=dataset.num_products,
         embedding_dim=config.embedding_dim,
@@ -1012,7 +1078,7 @@ def train_model(
     )
     
     print(f"\n--- Starting Training (Max Epochs: {config.epochs}) ---")
-    
+    history = {"train_loss": [], "val_nrmse_avg": [], "val_nrmse_vars": []}
     accumulation_steps = config.batch_size
     
     for epoch in range(config.epochs):
@@ -1053,11 +1119,13 @@ def train_model(
             batch_loss += loss.item() * accumulation_steps
         
         avg_loss = batch_loss / len(epoch_train_ids)
+        history["train_loss"].append(avg_loss)
         
         # Validation
         if (epoch + 1) % config.print_freq == 0:
             val_avg, val_vec = evaluate_model(net, dataset, stats, dataset.val_ids, config)
-            
+            history["val_nrmse_avg"].append(val_avg)
+            history["val_nrmse_vars"].append(val_vec)
             print(
                 f"Epoch {epoch + 1:04d} | "
                 f"Loss: {avg_loss:.5f} | "
@@ -1077,7 +1145,7 @@ def train_model(
     checkpoint = torch.load(early_stopping.save_path, map_location=config.device)
     net.load_state_dict(checkpoint["model_state_dict"])
     
-    return net, dataset, stats
+    return net, dataset, stats, history
 
 
 # ==============================================================================
@@ -1118,7 +1186,8 @@ def _run_training_task(data_path: str, config: Config) -> None:
     """Execute training task with evaluation and visualization."""
     print(f"\n>>> Multi-Task Training: Target {config.target_product}")
     
-    model, dataset, stats = train_model(data_path, config)
+    model, dataset, stats, history = train_model(data_path, config)
+    plot_training_metrics(history, dataset.STATE_COLS)
     
     # Evaluate on test set
     print("\n--- Evaluation on Unseen Target Runs ---")
@@ -1157,7 +1226,7 @@ def _run_evaluation_task(data_path: str, model_path: str, config: Config) -> Non
     
     # Initialize and load model
     net = KineticsNet(
-        input_dim=9,
+        input_dim=8,
         output_dim=6,
         num_products=dataset.num_products,
         embedding_dim=config.embedding_dim,
@@ -1200,7 +1269,7 @@ def _run_simulation_task(data_path: str, model_path: str, config: Config) -> Non
     
     # Initialize and load model
     net = KineticsNet(
-        input_dim=9,
+        input_dim=8,
         output_dim=6,
         num_products=sim_dataset.num_products,
         embedding_dim=config.embedding_dim,
@@ -1226,7 +1295,7 @@ def _run_simulation_task(data_path: str, model_path: str, config: Config) -> Non
 # ==============================================================================
 
 if __name__ == "__main__":
-    DATA_FILE = "data/hist.csv"
+    DATA_FILE = "data/test.csv"
     
     if os.path.exists(DATA_FILE):
         run_task(task_type="train", data_path=DATA_FILE)
